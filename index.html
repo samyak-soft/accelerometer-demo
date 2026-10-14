@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Real-time Accelerometer Plots (X, Y, Z, Resultant)</title>
+<style>
+  :root{
+    --bg:#0f1724;
+    --panel:#0b1220;
+    --accent:#06b6d4;
+    --muted:#94a3b8;
+    --height:120px;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:#e6eef6;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+  header{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.04);display:flex;gap:12px;align-items:center}
+  h1{font-size:16px;margin:0;font-weight:600}
+  .controls{margin-left:auto;display:flex;gap:8px;align-items:center}
+  button,select{background:var(--panel);color:inherit;border:1px solid rgba(255,255,255,0.04);padding:8px 10px;border-radius:8px}
+  .wrap{padding:12px;display:flex;flex-direction:column;gap:8px}
+  .canvas-row{background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);padding:8px;border-radius:8px;display:flex;flex-direction:column;gap:6px}
+  .label{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:var(--muted)}
+  canvas{width:100%;height:var(--height);background:linear-gradient(180deg, rgba(255,255,255,0.01), transparent);border-radius:6px;display:block}
+  .status{font-size:13px;color:var(--muted);margin-left:8px}
+  footer{padding:12px 16px;font-size:13px;color:var(--muted);border-top:1px solid rgba(255,255,255,0.02)}
+  .small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Accelerometer Live Plots</h1>
+  <div class="controls">
+    <button id="permBtn">Request Motion Permission</button>
+    <label class="small">Rate:
+      <select id="rateSelect" title="Sampling rate (Hz)">
+        <option value="60" selected>60 Hz</option>
+        <option value="30">30 Hz</option>
+        <option value="120">120 Hz</option>
+        <option value="240">240 Hz</option>
+      </select>
+    </label>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <span class="status" id="status">idle</span>
+  </div>
+</header>
+
+<div class="wrap" id="plots">
+  <div class="canvas-row">
+    <div class="label"><strong>X axis</strong><span id="xVal">0.00</span></div>
+    <canvas id="cX"></canvas>
+  </div>
+  <div class="canvas-row">
+    <div class="label"><strong>Y axis</strong><span id="yVal">0.00</span></div>
+    <canvas id="cY"></canvas>
+  </div>
+  <div class="canvas-row">
+    <div class="label"><strong>Z axis</strong><span id="zVal">0.00</span></div>
+    <canvas id="cZ"></canvas>
+  </div>
+  <div class="canvas-row">
+    <div class="label"><strong>Resultant</strong><span id="rVal">0.00</span></div>
+    <canvas id="cR"></canvas>
+  </div>
+</div>
+
+<footer>
+  <div class="small">Notes: Works best on mobile browsers. If permission is required on iOS, tap <strong>Request Motion Permission</strong> first. The code samples at the selected rate using the latest available device readings.</div>
+</footer>
+
+<script>
+/*
+  Real-time accelerometer plotting
+  - Uses DeviceMotionEvent (devicemotion)
+  - Samples at chosen rate using setInterval (60Hz default)
+  - Draws scrolling graphs on four canvases
+*/
+
+const canvases = {
+  x: document.getElementById('cX'),
+  y: document.getElementById('cY'),
+  z: document.getElementById('cZ'),
+  r: document.getElementById('cR')
+};
+const valEls = {
+  x: document.getElementById('xVal'),
+  y: document.getElementById('yVal'),
+  z: document.getElementById('zVal'),
+  r: document.getElementById('rVal')
+};
+const statusEl = document.getElementById('status');
+const permBtn = document.getElementById('permBtn');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const rateSelect = document.getElementById('rateSelect');
+
+let sampleInterval = null;
+let desiredHz = 60;
+let latest = {x:0,y:0,z:0};
+let running = false;
+let bufferSize = 1024; // number of samples to keep (scroll width)
+let buffers = {
+  x: new Float32Array(bufferSize),
+  y: new Float32Array(bufferSize),
+  z: new Float32Array(bufferSize),
+  r: new Float32Array(bufferSize)
+};
+let writeIndex = 0;
+let pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+
+// Setup canvases for high DPI
+function setupCanvas(c){
+  const rect = c.getBoundingClientRect();
+  c.width = Math.floor(rect.width * pixelRatio);
+  c.height = Math.floor(rect.height * pixelRatio);
+  const ctx = c.getContext('2d');
+  ctx.scale(pixelRatio, pixelRatio);
+  return ctx;
+}
+const ctx = {
+  x: setupCanvas(canvases.x),
+  y: setupCanvas(canvases.y),
+  z: setupCanvas(canvases.z),
+  r: setupCanvas(canvases.r)
+};
+
+// Resize handling
+window.addEventListener('resize', () => {
+  pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+  for (let k in canvases) ctx[k] = setupCanvas(canvases[k]);
+});
+
+// Device motion listener
+let lastEventTimestamp = 0;
+function handleMotion(e){
+  // accelerationIncludingGravity is more widely supported
+  const a = e.acceleration || e.accelerationIncludingGravity || {x:0,y:0,z:0};
+  latest.x = a.x || 0;
+  latest.y = a.y || 0;
+  latest.z = a.z || 0;
+  lastEventTimestamp = e.timeStamp || Date.now();
+}
+
+// Permission request for iOS 13+ Safari
+async function requestPermission(){
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+    try {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res === 'granted') {
+        statusEl.textContent = 'permission granted';
+      } else {
+        statusEl.textContent = 'permission denied';
+      }
+    } catch (err) {
+      statusEl.textContent = 'permission error';
+      console.warn(err);
+    }
+  } else {
+    statusEl.textContent = 'no permission required';
+  }
+}
+
+// Start sampling and drawing
+function start(){
+  if (running) return;
+  desiredHz = Number(rateSelect.value) || 60;
+  const ms = Math.max(1, Math.round(1000 / desiredHz));
+  // attach listener
+  window.addEventListener('devicemotion', handleMotion, {passive:true});
+  // sampling interval
+  sampleInterval = setInterval(sampleAndStore, ms);
+  running = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  statusEl.textContent = `running @ ${Math.round(1000/ms)} Hz`;
+  requestAnimationFrame(drawLoop);
+}
+
+// Stop sampling
+function stop(){
+  if (!running) return;
+  clearInterval(sampleInterval);
+  sampleInterval = null;
+  window.removeEventListener('devicemotion', handleMotion);
+  running = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  statusEl.textContent = 'stopped';
+}
+
+// Sample current latest values and store in circular buffer
+function sampleAndStore(){
+  const x = latest.x || 0;
+  const y = latest.y || 0;
+  const z = latest.z || 0;
+  const r = Math.sqrt(x*x + y*y + z*z);
+  buffers.x[writeIndex] = x;
+  buffers.y[writeIndex] = y;
+  buffers.z[writeIndex] = z;
+  buffers.r[writeIndex] = r;
+  writeIndex = (writeIndex + 1) % bufferSize;
+  // update numeric displays
+  valEls.x.textContent = x.toFixed(2);
+  valEls.y.textContent = y.toFixed(2);
+  valEls.z.textContent = z.toFixed(2);
+  valEls.r.textContent = r.toFixed(2);
+}
+
+// Drawing utilities
+function clearCanvas(c, ctxObj){
+  const rect = c.getBoundingClientRect();
+  ctxObj.clearRect(0,0,rect.width,rect.height);
+}
+function drawGrid(ctxObj, c, yTicks=4){
+  const rect = c.getBoundingClientRect();
+  ctxObj.save();
+  ctxObj.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctxObj.lineWidth = 1;
+  for (let i=0;i<=yTicks;i++){
+    const y = (rect.height / yTicks) * i;
+    ctxObj.beginPath();
+    ctxObj.moveTo(0.5, y+0.5);
+    ctxObj.lineTo(rect.width+0.5, y+0.5);
+    ctxObj.stroke();
+  }
+  ctxObj.restore();
+}
+function drawTrace(ctxObj, c, data, color='#06b6d4', yRange=20){
+  // yRange: +/- range in m/s^2 to map to canvas height
+  const rect = c.getBoundingClientRect();
+  const w = rect.width;
+  const h = rect.height;
+  ctxObj.save();
+  ctxObj.beginPath();
+  ctxObj.lineWidth = 1.5;
+  ctxObj.strokeStyle = color;
+  // map buffer to width
+  const step = Math.max(1, Math.floor(data.length / w));
+  // start from oldest sample (writeIndex) to newest
+  let idx = writeIndex;
+  for (let px=0; px<w; px++){
+    // average over step samples for smoother drawing
+    let sum = 0, count = 0;
+    for (let s=0; s<step; s++){
+      sum += data[idx];
+      count++;
+      idx = (idx + 1) % data.length;
+    }
+    const val = sum / count;
+    // map val to y (center is h/2)
+    const y = h/2 - (val / yRange) * (h/2);
+    if (px === 0) ctxObj.moveTo(px + 0.5, y + 0.5);
+    else ctxObj.lineTo(px + 0.5, y + 0.5);
+  }
+  ctxObj.stroke();
+  ctxObj.restore();
+}
+
+// Draw loop
+function drawLoop(){
+  // choose yRange adaptively per axis (common human-friendly range)
+  // typical gravity ~9.8 m/s^2; allow +/- 20 m/s^2
+  const ranges = {x:20, y:20, z:20, r:30};
+  // clear and draw each canvas
+  for (let k of ['x','y','z','r']){
+    const c = canvases[k];
+    const ctxObj = ctx[k];
+    clearCanvas(c, ctxObj);
+    drawGrid(ctxObj, c, 4);
+    const color = k === 'x' ? '#ef4444' : k === 'y' ? '#f59e0b' : k === 'z' ? '#10b981' : '#60a5fa';
+    drawTrace(ctxObj, c, buffers[k], color, ranges[k]);
+  }
+  if (running) requestAnimationFrame(drawLoop);
+}
+
+// UI wiring
+permBtn.addEventListener('click', requestPermission);
+startBtn.addEventListener('click', start);
+stopBtn.addEventListener('click', stop);
+
+// Try to initialize a few things: if DeviceMotion not supported, show message
+if (typeof DeviceMotionEvent === 'undefined') {
+  statusEl.textContent = 'DeviceMotion not supported';
+  startBtn.disabled = true;
+  permBtn.disabled = true;
+} else {
+  statusEl.textContent = 'ready';
+}
+
+// Warm up: fill buffers with zeros
+for (let k in buffers) for (let i=0;i<bufferSize;i++) buffers[k][i]=0;
+
+</script>
+</body>
+</html>
